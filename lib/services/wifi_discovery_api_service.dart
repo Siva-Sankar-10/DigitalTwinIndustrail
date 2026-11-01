@@ -4,12 +4,13 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class WifiDiscoveryApiService {
-  static const String baseUrl = 'http://127.0.0.1:8000';
+  static const String baseUrl = 'https://prem.tailaef534.ts.net';
 
   final http.Client _client;
 
   WifiDiscoveryApiService({http.Client? client})
       : _client = client ?? http.Client();
+
 
   Future<Map<String, dynamic>> _handleResponse(
     http.Response response,

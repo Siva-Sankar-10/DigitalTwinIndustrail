@@ -15,7 +15,10 @@ from app.discovery.trusted_inventory import (
     trust_device,
     remove_trusted_device,
 )
-
+from app.discovery.device_history import (
+    get_device_history,
+    get_device_events,
+)
 
 # ==========================================
 # APPLICATION
@@ -269,6 +272,40 @@ def delete_trusted_device(
         ) from error
 
     except RuntimeError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        ) from error
+# ==========================================
+# DEVICE HISTORY
+# ==========================================
+
+@app.get("/api/history/devices")
+def list_device_history(
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Return recently observed network devices."""
+
+    try:
+        return get_device_history(limit)
+
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        ) from error
+
+
+@app.get("/api/history/events")
+def list_device_events(
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Return recent device discovery and change events."""
+
+    try:
+        return get_device_events(limit)
+
+    except (ValueError, RuntimeError) as error:
         raise HTTPException(
             status_code=500,
             detail=str(error),

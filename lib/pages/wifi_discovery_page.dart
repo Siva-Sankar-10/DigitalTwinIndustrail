@@ -1,4 +1,3 @@
-
 import 'package:flutter/material.dart';
 
 import '../services/wifi_discovery_api_service.dart';
@@ -38,7 +37,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     _refreshAll();
   }
 
-  // Refresh network discovery and trusted inventory.
   Future<void> _refreshAll() async {
     await Future.wait([
       _scanNetwork(),
@@ -46,7 +44,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     ]);
   }
 
-  // Discover actual Wi-Fi devices.
   Future<void> _scanNetwork() async {
     if (_scanning) return;
 
@@ -70,11 +67,8 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
         );
       }
 
-      final interface =
-          Map<String, dynamic>.from(rawInterface);
-
-      final summary =
-          Map<String, dynamic>.from(rawSummary);
+      final interface = Map<String, dynamic>.from(rawInterface);
+      final summary = Map<String, dynamic>.from(rawSummary);
 
       final devices = rawDevices
           .whereType<Map>()
@@ -104,7 +98,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     }
   }
 
-  // Retrieve locally approved devices.
   Future<void> _loadTrustedDevices() async {
     if (_loadingTrusted) return;
 
@@ -156,14 +149,43 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     return value.toString();
   }
 
+  // Convert backend ISO timestamp into the phone's local time.
+  String _formatTimestamp(dynamic value) {
+    if (value == null || value.toString().trim().isEmpty) {
+      return 'Not recorded';
+    }
+
+    try {
+      final parsed = DateTime.parse(value.toString());
+      final local = parsed.toLocal();
+
+      const months = [
+        'Jan', 'Feb', 'Mar', 'Apr',
+        'May', 'Jun', 'Jul', 'Aug',
+        'Sep', 'Oct', 'Nov', 'Dec',
+      ];
+
+      final hour = local.hour % 12 == 0 ? 12 : local.hour % 12;
+      final period = local.hour >= 12 ? 'PM' : 'AM';
+
+      final day = local.day.toString().padLeft(2, '0');
+      final minute = local.minute.toString().padLeft(2, '0');
+      final second = local.second.toString().padLeft(2, '0');
+      final formattedHour = hour.toString().padLeft(2, '0');
+
+      return '$day ${months[local.month - 1]} ${local.year}, '
+          '$formattedHour:$minute:$second $period';
+    } catch (_) {
+      return 'Invalid timestamp';
+    }
+  }
+
   Color _statusColor(String status) {
     switch (status.toLowerCase()) {
       case 'responsive':
         return Colors.green;
-
       case 'neighbor_cache_only':
         return Colors.orange;
-
       default:
         return Colors.grey;
     }
@@ -173,20 +195,15 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     switch (classification.toLowerCase()) {
       case 'gateway':
         return Colors.blue;
-
       case 'trusted':
         return Colors.green;
-
       case 'unknown':
         return Colors.orange;
-
       default:
         return Colors.grey;
     }
   }
 
-  // Open the device-name dialog.
-  // The dialog owns its own TextEditingController.
   Future<String?> _requestDeviceName(String ipAddress) {
     return showDialog<String>(
       context: context,
@@ -199,7 +216,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     );
   }
 
-  // Approve a verified device through the backend.
   Future<void> _approveDevice(
     Map<String, dynamic> device,
   ) async {
@@ -211,7 +227,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
       return;
     }
 
-    // Ask for a device name.
     final name = await _requestDeviceName(ip);
 
     if (name == null || !mounted) return;
@@ -233,7 +248,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
             'Device approved successfully.',
       );
 
-      // Reload the discovery results and trusted inventory.
       await _refreshAll();
     } catch (error) {
       if (!mounted) return;
@@ -248,7 +262,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     }
   }
 
-  // Remove a device from the trusted inventory.
   Future<void> _removeTrustedDevice(
     Map<String, dynamic> device,
   ) async {
@@ -394,6 +407,10 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     final status = _value(device['status']);
     final classification = _value(device['classification']);
 
+    final firstSeen = _formatTimestamp(device['first_seen']);
+    final lastSeen = _formatTimestamp(device['last_seen']);
+    final sightings = _value(device['sightings']);
+
     final isGateway = device['is_gateway'] == true;
     final isTrusted = device['is_trusted'] == true;
     final isBusy = _busyMacs.contains(mac);
@@ -488,6 +505,67 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
               Icons.fingerprint,
             ),
 
+            // NEW: Device observation history.
+            const SizedBox(height: 16),
+
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Theme.of(context)
+                    .colorScheme
+                    .surfaceContainerHighest
+                    .withValues(alpha: 0.45),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(
+                        Icons.history,
+                        size: 18,
+                        color: Colors.blueGrey,
+                      ),
+                      SizedBox(width: 7),
+                      Text(
+                        'DEVICE HISTORY',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 13),
+
+                  _deviceDetail(
+                    'First Seen',
+                    firstSeen,
+                    Icons.first_page,
+                  ),
+
+                  const SizedBox(height: 11),
+
+                  _deviceDetail(
+                    'Last Seen',
+                    lastSeen,
+                    Icons.access_time,
+                  ),
+
+                  const SizedBox(height: 11),
+
+                  _deviceDetail(
+                    'Total Sightings',
+                    sightings,
+                    Icons.visibility_outlined,
+                  ),
+                ],
+              ),
+            ),
+
             if (!isGateway &&
                 classification == 'unknown') ...[
               const SizedBox(height: 15),
@@ -541,7 +619,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     );
   }
 
-  // Locally approved device inventory.
   Widget _trustedInventorySection() {
     return Card(
       child: ExpansionTile(
@@ -644,7 +721,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
           ),
         ],
       ),
-
       body: RefreshIndicator(
         onRefresh: _refreshAll,
         child: ListView(
@@ -878,7 +954,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
 
 // =====================================================
 // DEVICE NAME DIALOG
-// This widget owns and disposes its own controller.
 // =====================================================
 
 class _DeviceNameDialog extends StatefulWidget {
@@ -913,7 +988,6 @@ class _DeviceNameDialogState extends State<_DeviceNameDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       title: const Text('Approve device?'),
-
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -923,18 +997,14 @@ class _DeviceNameDialogState extends State<_DeviceNameDialog> {
               'Only approve this device after verifying '
               'that it belongs to an authorized user.',
             ),
-
             const SizedBox(height: 14),
-
             Text(
               'IP address: ${widget.ipAddress}',
               style: const TextStyle(
                 fontWeight: FontWeight.w600,
               ),
             ),
-
             const SizedBox(height: 12),
-
             TextField(
               controller: _controller,
               autofocus: true,
@@ -948,7 +1018,6 @@ class _DeviceNameDialogState extends State<_DeviceNameDialog> {
           ],
         ),
       ),
-
       actions: [
         TextButton(
           onPressed: () {
@@ -956,7 +1025,6 @@ class _DeviceNameDialogState extends State<_DeviceNameDialog> {
           },
           child: const Text('Cancel'),
         ),
-
         FilledButton(
           onPressed: () {
             final name = _controller.text.trim();

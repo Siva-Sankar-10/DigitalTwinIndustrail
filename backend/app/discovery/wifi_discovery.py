@@ -7,6 +7,11 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from app.discovery.device_history import (
+    record_discovery_scan,
+    get_device_history,
+)
+
 from app.discovery.trusted_inventory import is_trusted
 
 
@@ -149,10 +154,12 @@ def _format_neighbor_state(state: Any) -> str:
 
     try:
         numeric_state = int(state)
+
         return state_names.get(
             numeric_state,
             str(state),
         )
+
     except (ValueError, TypeError):
         return str(state)
 
@@ -197,6 +204,10 @@ def discover_wifi_devices(
     It does not modify, disconnect, or block network devices.
     """
 
+    # --------------------------------------
+    # 1. GET WI-FI CONFIGURATION
+    # --------------------------------------
+
     config = _get_wifi_configuration(interface_alias)
 
     local_ip = config["ip_address"]
@@ -225,6 +236,10 @@ def discover_wifi_devices(
             "timeout_ms must be between 100 and 1000."
         )
 
+    # --------------------------------------
+    # 2. BUILD DISCOVERY TARGETS
+    # --------------------------------------
+
     # Exclude the laptop itself.
     targets = [
         str(address)
@@ -232,10 +247,14 @@ def discover_wifi_devices(
         if str(address) != local_ip
     ]
 
-    # Perform limited-concurrency ICMP discovery.
+    # --------------------------------------
+    # 3. PERFORM ICMP DISCOVERY
+    # --------------------------------------
+
     with ThreadPoolExecutor(
         max_workers=max_workers
     ) as executor:
+
         responses = list(
             executor.map(
                 lambda address: _ping_host(
@@ -253,7 +272,10 @@ def discover_wifi_devices(
         if responded
     }
 
-    # Read the neighbor table after the discovery pass.
+    # --------------------------------------
+    # 4. READ WINDOWS NEIGHBOR TABLE
+    # --------------------------------------
+
     neighbors = _get_neighbors(
         config["interface_index"]
     )
@@ -261,6 +283,7 @@ def discover_wifi_devices(
     devices = []
 
     for neighbor in neighbors:
+
         address = neighbor.get("IPAddress")
         raw_mac = neighbor.get("LinkLayerAddress")
         state = neighbor.get("State", "Unknown")
@@ -287,7 +310,7 @@ def discover_wifi_devices(
         responded = address in responsive_ips
         is_gateway = address == gateway
 
-        # Compare the discovered MAC against local inventory.
+        # Check local trusted-device inventory.
         trusted = is_trusted(mac)
 
         if is_gateway:
@@ -297,7 +320,7 @@ def discover_wifi_devices(
         else:
             classification = "unknown"
 
-        devices.append({
+        device = {
             "ip_address": address,
             "mac_address": mac,
             "status": (
@@ -310,9 +333,14 @@ def discover_wifi_devices(
             "is_trusted": trusted,
             "classification": classification,
             "source": "windows_wifi_neighbor_table",
-        })
+        }
 
-    # Remove duplicate IP entries and sort numerically.
+        devices.append(device)
+
+    # --------------------------------------
+    # 5. REMOVE DUPLICATES AND SORT
+    # --------------------------------------
+
     unique_devices = {
         device["ip_address"]: device
         for device in devices
@@ -325,9 +353,62 @@ def discover_wifi_devices(
         ),
     )
 
+    # --------------------------------------
+    # 6. SAVE DEVICE HISTORY
+    # --------------------------------------
+
+    history_result = record_discovery_scan(devices)
+
+    # Retrieve persistent history.
+    history_data = get_device_history(limit=500)
+
+    history_by_mac = {
+        item["mac_address"]: item
+        for item in history_data["devices"]
+    }
+
+    # Attach history information to every discovered device.
+    for device in devices:
+
+        history = history_by_mac.get(
+            device["mac_address"]
+        )
+
+        if history:
+            device["first_seen"] = history.get("first_seen")
+            device["last_seen"] = history.get("last_seen")
+            device["sightings"] = history.get("sightings", 0)
+
+    # --------------------------------------
+    # 7. CALCULATE DISCOVERY SUMMARY
+    # --------------------------------------
+
+    responsive_count = sum(
+        1
+        for device in devices
+        if device["status"] == "responsive"
+    )
+
+    trusted_count = sum(
+        1
+        for device in devices
+        if device["classification"] == "trusted"
+    )
+
+    unknown_count = sum(
+        1
+        for device in devices
+        if device["classification"] == "unknown"
+    )
+
+    # --------------------------------------
+    # 8. RETURN COMPLETE RESPONSE
+    # --------------------------------------
+
     return {
         "data_source": "REAL_WIFI_DISCOVERY",
         "simulation": False,
+
         "interface": {
             "name": config["interface_alias"],
             "index": config["interface_index"],
@@ -336,26 +417,20 @@ def discover_wifi_devices(
             "network": str(network),
             "gateway": gateway,
         },
+
         "summary": {
             "discovered_devices": len(devices),
-            "responsive_devices": sum(
-                1
-                for device in devices
-                if device["status"] == "responsive"
-            ),
-            "trusted_devices": sum(
-                1
-                for device in devices
-                if device["classification"] == "trusted"
-            ),
-            "unknown_devices": sum(
-                1
-                for device in devices
-                if device["classification"] == "unknown"
-            ),
+            "responsive_devices": responsive_count,
+            "trusted_devices": trusted_count,
+            "unknown_devices": unknown_count,
+            "newly_observed_devices": history_result["new_devices"],
             "gateway_detected": gateway is not None,
         },
+
+        "history": history_result,
+
         "devices": devices,
+
         "limitations": [
             "Only devices visible to this laptop are returned.",
             "ICMP-disabled devices may still appear in the neighbor table.",
