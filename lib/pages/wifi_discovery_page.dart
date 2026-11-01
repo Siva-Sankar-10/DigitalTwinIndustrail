@@ -1,3 +1,4 @@
+
 import 'package:flutter/material.dart';
 
 import '../services/wifi_discovery_api_service.dart';
@@ -18,13 +19,28 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
   List<Map<String, dynamic>> _devices = [];
   List<Map<String, dynamic>> _trustedDevices = [];
 
-  String? _error;
-  String? _inventoryError;
+  // Network inventory and selection.
+  List<Map<String, dynamic>> _networks = [];
+  List<Map<String, dynamic>> _networkDevices = [];
+  List<Map<String, dynamic>> _networkEvents = [];
+
+  Map<String, dynamic>? _currentNetwork;
+  Map<String, dynamic>? _selectedNetworkInfo;
+
+  String? _selectedNetworkId;
+  String? _networkError;
 
   DateTime? _lastScan;
 
   bool _scanning = false;
   bool _loadingTrusted = false;
+  bool _loadingNetworks = false;
+  bool _loadingNetworkHistory = false;
+
+  int _historyRequestToken = 0;
+
+  String? _error;
+  String? _inventoryError;
 
   final Set<String> _busyMacs = {};
 
@@ -37,15 +53,25 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     _refreshAll();
   }
 
+  // Scan the laptop's current network first,
+  // then load saved networks and trusted devices.
   Future<void> _refreshAll() async {
+    await _scanNetwork();
+
+    if (!mounted) return;
+
     await Future.wait([
-      _scanNetwork(),
       _loadTrustedDevices(),
+      _loadNetworks(),
     ]);
   }
 
+  // Discover devices on the laptop's currently connected network.
   Future<void> _scanNetwork() async {
     if (_scanning) return;
+
+    final previousNetworkId =
+        _currentNetwork?['network_id']?.toString();
 
     setState(() {
       _scanning = true;
@@ -58,22 +84,40 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
       final rawInterface = response['interface'];
       final rawSummary = response['summary'];
       final rawDevices = response['devices'];
+      final rawNetwork = response['network'];
 
       if (rawInterface is! Map ||
           rawSummary is! Map ||
-          rawDevices is! List) {
+          rawDevices is! List ||
+          rawNetwork is! Map) {
         throw const FormatException(
           'Invalid Wi-Fi discovery response.',
         );
       }
 
-      final interface = Map<String, dynamic>.from(rawInterface);
-      final summary = Map<String, dynamic>.from(rawSummary);
+      final interface =
+          Map<String, dynamic>.from(rawInterface);
+
+      final summary =
+          Map<String, dynamic>.from(rawSummary);
+
+      final currentNetwork =
+          Map<String, dynamic>.from(rawNetwork);
 
       final devices = rawDevices
           .whereType<Map>()
           .map((item) => Map<String, dynamic>.from(item))
           .toList();
+
+      final newNetworkId =
+          currentNetwork['network_id']?.toString();
+
+      // If the laptop changes networks, automatically
+      // move selection from the old current network
+      // to the newly connected network.
+      final networkChanged =
+          previousNetworkId != null &&
+          previousNetworkId != newNetworkId;
 
       if (!mounted) return;
 
@@ -81,7 +125,14 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
         _interface = interface;
         _summary = summary;
         _devices = devices;
+        _currentNetwork = currentNetwork;
         _lastScan = DateTime.now();
+
+        if (_selectedNetworkId == null ||
+            (networkChanged &&
+                _selectedNetworkId == previousNetworkId)) {
+          _selectedNetworkId = newNetworkId;
+        }
       });
     } catch (error) {
       if (!mounted) return;
@@ -98,6 +149,7 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     }
   }
 
+  // Load locally approved devices.
   Future<void> _loadTrustedDevices() async {
     if (_loadingTrusted) return;
 
@@ -141,6 +193,203 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     }
   }
 
+  // Load all previously identified networks.
+  Future<void> _loadNetworks() async {
+    if (_loadingNetworks) return;
+
+    setState(() {
+      _loadingNetworks = true;
+      _networkError = null;
+    });
+
+    try {
+      final response = await _api.fetchNetworks();
+      final rawNetworks = response['networks'];
+
+      if (rawNetworks is! List) {
+        throw const FormatException(
+          'Invalid network inventory response.',
+        );
+      }
+
+      final networks = rawNetworks
+          .whereType<Map>()
+          .map((item) => Map<String, dynamic>.from(item))
+          .toList();
+
+      final currentId =
+          _currentNetwork?['network_id']?.toString();
+
+      final selectedExists = networks.any(
+        (network) =>
+            network['network_id']?.toString() ==
+            _selectedNetworkId,
+      );
+
+      final currentExists = networks.any(
+        (network) =>
+            network['network_id']?.toString() == currentId,
+      );
+
+      final String? nextId = selectedExists
+          ? _selectedNetworkId
+          : currentExists
+              ? currentId
+              : networks.isNotEmpty
+                  ? networks.first['network_id']?.toString()
+                  : null;
+
+      if (!mounted) return;
+
+      setState(() {
+        _networks = networks;
+        _selectedNetworkId = nextId;
+      });
+
+      if (nextId != null) {
+        await _loadNetworkHistory(nextId);
+      } else {
+        setState(() {
+          _selectedNetworkInfo = null;
+          _networkDevices = [];
+          _networkEvents = [];
+        });
+      }
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        _networkError = error.toString();
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingNetworks = false;
+        });
+      }
+    }
+  }
+
+  // Retrieve devices and events for one selected network.
+  Future<void> _loadNetworkHistory(String networkId) async {
+    if (!mounted) return;
+
+    final requestToken = ++_historyRequestToken;
+
+    setState(() {
+      _loadingNetworkHistory = true;
+      _networkError = null;
+      _selectedNetworkId = networkId;
+
+      // Avoid showing the previous network's history
+      // while a new network is loading.
+      _selectedNetworkInfo = null;
+      _networkDevices = [];
+      _networkEvents = [];
+    });
+
+    try {
+      final results = await Future.wait([
+        _api.fetchNetworkDevices(
+          networkId: networkId,
+        ),
+        _api.fetchNetworkEvents(
+          networkId: networkId,
+        ),
+      ]);
+
+      final deviceResponse = results[0];
+      final eventResponse = results[1];
+
+      final rawNetwork = deviceResponse['network'];
+      final rawDevices = deviceResponse['devices'];
+      final rawEvents = eventResponse['events'];
+
+      if (rawNetwork is! Map ||
+          rawDevices is! List ||
+          rawEvents is! List) {
+        throw const FormatException(
+          'Invalid network history response.',
+        );
+      }
+
+      final networkInfo =
+          Map<String, dynamic>.from(rawNetwork);
+
+      final devices = rawDevices
+          .whereType<Map>()
+          .map((item) {
+            final record = Map<String, dynamic>.from(item);
+
+            final classification =
+                record['last_classification']?.toString() ??
+                    'unknown';
+
+            return <String, dynamic>{
+              'ip_address':
+                  record['last_ip_address'] ?? 'Unavailable',
+              'mac_address':
+                  record['mac_address'] ?? 'Unavailable',
+              'status':
+                  record['last_status'] ?? 'unknown',
+              'classification': classification,
+              'is_gateway': classification == 'gateway',
+              'is_trusted': classification == 'trusted',
+              'first_seen': record['first_seen'],
+              'last_seen': record['last_seen'],
+              'sightings': record['sightings'] ?? 0,
+              'network_id': networkId,
+              'network_name': networkInfo['network_name'],
+              'source': 'network_device_history',
+            };
+          })
+          .toList();
+
+      final events = rawEvents
+          .whereType<Map>()
+          .map((item) => Map<String, dynamic>.from(item))
+          .toList();
+
+      if (!mounted || requestToken != _historyRequestToken) {
+        return;
+      }
+
+      setState(() {
+        _selectedNetworkInfo = networkInfo;
+        _networkDevices = devices;
+        _networkEvents = events;
+      });
+    } catch (error) {
+      if (!mounted || requestToken != _historyRequestToken) {
+        return;
+      }
+
+      setState(() {
+        _networkError = error.toString();
+        _selectedNetworkInfo = null;
+        _networkDevices = [];
+        _networkEvents = [];
+      });
+    } finally {
+      if (mounted && requestToken == _historyRequestToken) {
+        setState(() {
+          _loadingNetworkHistory = false;
+        });
+      }
+    }
+  }
+
+  // Change the network selected in the dropdown.
+  Future<void> _selectNetwork(String? networkId) async {
+    if (networkId == null || networkId.isEmpty) return;
+    if (networkId == _selectedNetworkId &&
+        _selectedNetworkInfo != null) {
+      return;
+    }
+
+    await _loadNetworkHistory(networkId);
+  }
+
   String _value(dynamic value) {
     if (value == null || value.toString().trim().isEmpty) {
       return 'Unavailable';
@@ -149,7 +398,7 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     return value.toString();
   }
 
-  // Convert backend ISO timestamp into the phone's local time.
+  // Convert backend ISO timestamps to the phone's local time.
   String _formatTimestamp(dynamic value) {
     if (value == null || value.toString().trim().isEmpty) {
       return 'Not recorded';
@@ -199,6 +448,20 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
         return Colors.green;
       case 'unknown':
         return Colors.orange;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  Color _severityColor(String severity) {
+    switch (severity.toLowerCase()) {
+      case 'critical':
+        return Colors.red;
+      case 'warning':
+      case 'review':
+        return Colors.orange;
+      case 'info':
+        return Colors.blue;
       default:
         return Colors.grey;
     }
@@ -386,6 +649,7 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
             ),
           ),
         ),
+        const SizedBox(width: 8),
         Flexible(
           child: Text(
             value,
@@ -400,8 +664,196 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     );
   }
 
-  // Individual discovered device card.
-  Widget _deviceCard(Map<String, dynamic> device) {
+  // Network selector and selected-network details.
+  Widget _networkSelectorSection() {
+    final currentId =
+        _currentNetwork?['network_id']?.toString();
+
+    final selectedId = _selectedNetworkId;
+
+    final selectedExists = _networks.any(
+      (network) =>
+          network['network_id']?.toString() == selectedId,
+    );
+
+    final isCurrentNetwork =
+        selectedId != null && selectedId == currentId;
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(15),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(
+                  Icons.storage_outlined,
+                  color: Colors.blue,
+                ),
+                const SizedBox(width: 9),
+                const Expanded(
+                  child: Text(
+                    'Network Inventory',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                ),
+                if (_loadingNetworks ||
+                    _loadingNetworkHistory)
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                    ),
+                  ),
+              ],
+            ),
+
+            const SizedBox(height: 14),
+
+            DropdownButtonFormField<String>(
+              key: ValueKey(selectedId),
+              initialValue:
+                  selectedExists ? selectedId : null,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Select a network',
+                prefixIcon: Icon(Icons.wifi_find),
+                border: OutlineInputBorder(),
+              ),
+              hint: const Text('Choose a saved network'),
+              items: _networks.map((network) {
+                final id =
+                    network['network_id']?.toString() ?? '';
+
+                final name =
+                    network['network_name']?.toString() ??
+                        'Unnamed network';
+
+                return DropdownMenuItem<String>(
+                  value: id,
+                  child: Text(
+                    name,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                );
+              }).toList(),
+              onChanged: _loadingNetworkHistory
+                  ? null
+                  : _selectNetwork,
+            ),
+
+            const SizedBox(height: 12),
+
+            if (_networks.isEmpty &&
+                !_loadingNetworks)
+              const Text(
+                'No saved networks found. Scan your current Wi-Fi network first.',
+                style: TextStyle(
+                  color: Colors.grey,
+                  fontSize: 12,
+                ),
+              ),
+
+            if (_selectedNetworkInfo != null) ...[
+              const Divider(height: 24),
+
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _value(
+                        _selectedNetworkInfo!['network_name'],
+                      ),
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isCurrentNetwork
+                          ? Colors.green.withValues(alpha: 0.12)
+                          : Colors.blue.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Text(
+                      isCurrentNetwork ? 'CURRENT' : 'SAVED',
+                      style: TextStyle(
+                        color: isCurrentNetwork
+                            ? Colors.green
+                            : Colors.blue,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 13),
+
+              _deviceDetail(
+                'SSID',
+                _value(_selectedNetworkInfo!['ssid']),
+                Icons.wifi,
+              ),
+
+              const SizedBox(height: 10),
+
+              _deviceDetail(
+                'Gateway',
+                _value(_selectedNetworkInfo!['gateway']),
+                Icons.router_outlined,
+              ),
+
+              const SizedBox(height: 10),
+
+              _deviceDetail(
+                'Subnet',
+                _value(_selectedNetworkInfo!['subnet']),
+                Icons.lan_outlined,
+              ),
+
+              const SizedBox(height: 10),
+
+              _deviceDetail(
+                'Total scans',
+                _value(_selectedNetworkInfo!['scan_count']),
+                Icons.radar,
+              ),
+            ],
+
+            if (_networkError != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _networkError!,
+                style: const TextStyle(
+                  color: Colors.red,
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Individual discovered or historically observed device card.
+  Widget _deviceCard(
+    Map<String, dynamic> device, {
+    required bool allowApproval,
+  }) {
     final ip = _value(device['ip_address']);
     final mac = _value(device['mac_address']);
     final status = _value(device['status']);
@@ -505,7 +957,6 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
               Icons.fingerprint,
             ),
 
-            // NEW: Device observation history.
             const SizedBox(height: 16),
 
             Container(
@@ -566,7 +1017,21 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
               ),
             ),
 
-            if (!isGateway &&
+            if (!allowApproval &&
+                !isGateway &&
+                classification == 'unknown') ...[
+              const SizedBox(height: 10),
+              const Text(
+                'Historical network: approval is available only while viewing the current network.',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Colors.grey,
+                ),
+              ),
+            ],
+
+            if (allowApproval &&
+                !isGateway &&
                 classification == 'unknown') ...[
               const SizedBox(height: 15),
               SizedBox(
@@ -619,6 +1084,82 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     );
   }
 
+  // Discovery and security event timeline.
+  Widget _networkEventsSection() {
+    return Card(
+      child: ExpansionTile(
+        leading: const Icon(
+          Icons.notifications_active_outlined,
+          color: Colors.blue,
+        ),
+        title: const Text(
+          'Network Events',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        subtitle: Text(
+          '${_networkEvents.length} recorded events',
+        ),
+        children: [
+          if (_loadingNetworkHistory)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: CircularProgressIndicator(),
+            )
+          else if (_networkEvents.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'No events recorded for this network.',
+                textAlign: TextAlign.center,
+              ),
+            )
+          else
+            ..._networkEvents.map((event) {
+              final severity =
+                  event['severity']?.toString() ?? 'info';
+
+              final color = _severityColor(severity);
+
+              final message =
+                  event['message']?.toString() ??
+                      event['event_type']?.toString() ??
+                      'Network event';
+
+              final timestamp = _formatTimestamp(
+                event['timestamp'] ?? event['occurred_at'],
+              );
+
+              return ListTile(
+                leading: CircleAvatar(
+                  backgroundColor:
+                      color.withValues(alpha: 0.12),
+                  child: Icon(
+                    severity == 'critical'
+                        ? Icons.error_outline
+                        : severity == 'review' ||
+                                severity == 'warning'
+                            ? Icons.warning_amber_outlined
+                            : Icons.info_outline,
+                    color: color,
+                  ),
+                ),
+                title: Text(
+                  message,
+                  style: const TextStyle(fontSize: 13),
+                ),
+                subtitle: Text(
+                  '$severity • $timestamp',
+                  style: const TextStyle(fontSize: 11),
+                ),
+              );
+            }),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+
+  // Locally approved device inventory.
   Widget _trustedInventorySection() {
     return Card(
       child: ExpansionTile(
@@ -635,6 +1176,20 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
         ),
         trailing: const Icon(Icons.expand_more),
         children: [
+          const Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 4,
+            ),
+            child: Text(
+              'This approval inventory is currently shared across networks.',
+              style: TextStyle(
+                color: Colors.grey,
+                fontSize: 11,
+              ),
+            ),
+          ),
+
           if (_loadingTrusted)
             const Padding(
               padding: EdgeInsets.all(16),
@@ -710,6 +1265,19 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
     final responsive = _summary?['responsive_devices'] ?? 0;
     final unknown = _summary?['unknown_devices'] ?? 0;
 
+    final currentId =
+        _currentNetwork?['network_id']?.toString();
+
+    final isCurrentSelection =
+        _selectedNetworkId != null &&
+        _selectedNetworkId == currentId;
+
+    final displayedDevices = _selectedNetworkInfo != null
+        ? _networkDevices
+        : isCurrentSelection
+            ? _devices
+            : <Map<String, dynamic>>[];
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Wi-Fi Discovery'),
@@ -721,12 +1289,14 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
           ),
         ],
       ),
+
       body: RefreshIndicator(
         onRefresh: _refreshAll,
         child: ListView(
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.all(16),
           children: [
+            // Discovery mode banner.
             Card(
               color: Colors.green.withValues(alpha: 0.09),
               child: const Padding(
@@ -752,7 +1322,7 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
                           ),
                           SizedBox(height: 4),
                           Text(
-                            'Read-only discovery from your laptop.',
+                            'Read-only discovery performed by your laptop.',
                             style: TextStyle(fontSize: 11),
                           ),
                         ],
@@ -765,8 +1335,9 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
 
             const SizedBox(height: 16),
 
+            // Current laptop network.
             Text(
-              'Connected Network',
+              'Laptop Connection',
               style: Theme.of(context).textTheme.titleLarge,
             ),
 
@@ -784,13 +1355,19 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
                     ),
                     const SizedBox(height: 12),
                     _deviceDetail(
+                      'Connected SSID',
+                      _value(_interface?['ssid']),
+                      Icons.wifi_tethering,
+                    ),
+                    const SizedBox(height: 12),
+                    _deviceDetail(
                       'Laptop IP',
                       _value(_interface?['ip_address']),
                       Icons.computer,
                     ),
                     const SizedBox(height: 12),
                     _deviceDetail(
-                      'Network',
+                      'Subnet',
                       _value(_interface?['network']),
                       Icons.lan,
                     ),
@@ -807,9 +1384,32 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
 
             const SizedBox(height: 18),
 
+            // Saved network selector.
             Text(
-              'Discovery Summary',
+              'Select Network',
               style: Theme.of(context).textTheme.titleLarge,
+            ),
+
+            const SizedBox(height: 10),
+
+            _networkSelectorSection(),
+
+            const SizedBox(height: 18),
+
+            // Current scan summary.
+            Text(
+              'Latest Scan Summary',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+
+            const SizedBox(height: 4),
+
+            const Text(
+              'These counts refer to the laptop\'s currently connected network.',
+              style: TextStyle(
+                color: Colors.grey,
+                fontSize: 11,
+              ),
             ),
 
             const SizedBox(height: 8),
@@ -849,6 +1449,7 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
 
             const SizedBox(height: 15),
 
+            // Scan only the currently connected network.
             SizedBox(
               height: 48,
               child: FilledButton.icon(
@@ -865,8 +1466,8 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
                     : const Icon(Icons.radar),
                 label: Text(
                   _scanning
-                      ? 'Scanning network...'
-                      : 'Scan Wi-Fi Network',
+                      ? 'Scanning current network...'
+                      : 'Scan Current Wi-Fi Network',
                 ),
               ),
             ),
@@ -898,29 +1499,74 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
               ),
             ],
 
+            if (_networkError != null) ...[
+              const SizedBox(height: 12),
+              Card(
+                color: Colors.red.withValues(alpha: 0.08),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(
+                    'Network history error: $_networkError',
+                    style: const TextStyle(color: Colors.red),
+                  ),
+                ),
+              ),
+            ],
+
             const SizedBox(height: 20),
 
+            // Devices belonging to the selected network.
             Text(
-              'Discovered Devices (${_devices.length})',
+              'Devices in Selected Network '
+              '(${displayedDevices.length})',
               style: Theme.of(context).textTheme.titleLarge,
             ),
 
             const SizedBox(height: 10),
 
-            if (_devices.isEmpty)
+            if (_loadingNetworkHistory)
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(22),
+                  child: Center(
+                    child: CircularProgressIndicator(),
+                  ),
+                ),
+              )
+            else if (_selectedNetworkInfo == null &&
+                _networkDevices.isEmpty)
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(18),
                   child: Text(
-                    _scanning
-                        ? 'Discovering visible network devices...'
-                        : 'No visible devices found.',
+                    _networks.isEmpty
+                        ? 'Scan a network to create its inventory.'
+                        : 'Select a network to view its history.',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              )
+            else if (displayedDevices.isEmpty)
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(18),
+                  child: Text(
+                    'No devices recorded for this network.',
                     textAlign: TextAlign.center,
                   ),
                 ),
               )
             else
-              ..._devices.map(_deviceCard),
+              ...displayedDevices.map(
+                (device) => _deviceCard(
+                  device,
+                  allowApproval: isCurrentSelection,
+                ),
+              ),
+
+            const SizedBox(height: 12),
+
+            _networkEventsSection(),
 
             const SizedBox(height: 12),
 
@@ -934,9 +1580,10 @@ class _WifiDiscoveryPageState extends State<WifiDiscoveryPage> {
                 padding: EdgeInsets.all(13),
                 child: Text(
                   'Security note: Unknown devices are not automatically '
-                  'intruders. Approve only devices whose ownership and '
-                  'authorization have been verified. This screen manages '
-                  'the local inventory; it does not block Wi-Fi clients.',
+                  'intruders. Verify ownership before approval. Historical '
+                  'network data represents previous observations, not '
+                  'current device connectivity. This screen does not '
+                  'block or disconnect Wi-Fi clients.',
                   style: TextStyle(
                     fontSize: 11,
                     color: Colors.orange,

@@ -11,7 +11,7 @@ class WifiDiscoveryApiService {
   WifiDiscoveryApiService({http.Client? client})
       : _client = client ?? http.Client();
 
-
+  // Handle and validate API responses.
   Future<Map<String, dynamic>> _handleResponse(
     http.Response response,
   ) async {
@@ -41,33 +41,111 @@ class WifiDiscoveryApiService {
     return Map<String, dynamic>.from(decoded);
   }
 
-  // 1. Discover actual Wi-Fi devices.
+  // Common GET request helper.
+  Future<Map<String, dynamic>> _get(
+    Uri uri, {
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    final response = await _client
+        .get(uri)
+        .timeout(timeout);
+
+    return _handleResponse(response);
+  }
+
+  // 1. Discover actual Wi-Fi devices through the laptop.
   Future<Map<String, dynamic>> discoverDevices({
     String interfaceAlias = 'Wi-Fi',
   }) async {
-    final uri = Uri.parse('$baseUrl/api/discovery/wifi').replace(
+    final uri = Uri.parse(
+      '$baseUrl/api/discovery/wifi',
+    ).replace(
       queryParameters: {
         'interface_alias': interfaceAlias,
       },
     );
 
-    final response = await _client
-        .get(uri)
-        .timeout(const Duration(seconds: 30));
-
-    return _handleResponse(response);
+    return _get(
+      uri,
+      timeout: const Duration(seconds: 90),
+    );
   }
 
-  // 2. Retrieve approved devices.
+  // 2. Retrieve all known networks.
+  Future<Map<String, dynamic>> fetchNetworks() async {
+    final uri = Uri.parse('$baseUrl/api/networks');
+
+    return _get(uri);
+  }
+
+  // 3. Retrieve devices belonging to one network.
+  Future<Map<String, dynamic>> fetchNetworkDevices({
+    required String networkId,
+    int limit = 100,
+  }) async {
+    final id = networkId.trim();
+
+    if (id.isEmpty) {
+      throw ArgumentError('Network ID cannot be empty.');
+    }
+
+    if (limit < 1 || limit > 500) {
+      throw ArgumentError(
+        'Limit must be between 1 and 500.',
+      );
+    }
+
+    final uri = Uri.parse(
+      '$baseUrl/api/history/devices',
+    ).replace(
+      queryParameters: {
+        'network_id': id,
+        'limit': limit.toString(),
+      },
+    );
+
+    return _get(uri);
+  }
+
+  // 4. Retrieve events belonging to one network.
+  Future<Map<String, dynamic>> fetchNetworkEvents({
+    required String networkId,
+    int limit = 100,
+  }) async {
+    final id = networkId.trim();
+
+    if (id.isEmpty) {
+      throw ArgumentError('Network ID cannot be empty.');
+    }
+
+    if (limit < 1 || limit > 500) {
+      throw ArgumentError(
+        'Limit must be between 1 and 500.',
+      );
+    }
+
+    final uri = Uri.parse(
+      '$baseUrl/api/history/events',
+    ).replace(
+      queryParameters: {
+        'network_id': id,
+        'limit': limit.toString(),
+      },
+    );
+
+    return _get(uri);
+  }
+
+  // 5. Retrieve locally approved devices.
   Future<Map<String, dynamic>> fetchTrustedDevices() async {
-    final response = await _client
-        .get(Uri.parse('$baseUrl/api/trusted-devices'))
-        .timeout(const Duration(seconds: 15));
+    final uri = Uri.parse(
+      '$baseUrl/api/trusted-devices',
+    );
 
-    return _handleResponse(response);
+    return _get(uri);
   }
 
-  // 3. Approve a verified device.
+  // 6. Approve a verified device.
   Future<Map<String, dynamic>> approveDevice({
     required String macAddress,
     required String deviceName,
@@ -88,12 +166,13 @@ class WifiDiscoveryApiService {
     return _handleResponse(response);
   }
 
-  // 4. Remove a device from trusted inventory.
+  // 7. Remove a device from trusted inventory.
   Future<Map<String, dynamic>> removeTrustedDevice(
     String macAddress,
   ) async {
     final uri = Uri.parse(
-      '$baseUrl/api/trusted-devices/${Uri.encodeComponent(macAddress)}',
+      '$baseUrl/api/trusted-devices/'
+      '${Uri.encodeComponent(macAddress)}',
     );
 
     final response = await _client
@@ -103,6 +182,7 @@ class WifiDiscoveryApiService {
     return _handleResponse(response);
   }
 
+  // Release HTTP resources.
   void dispose() {
     _client.close();
   }

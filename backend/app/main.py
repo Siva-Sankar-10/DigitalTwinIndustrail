@@ -1,5 +1,7 @@
 
 import subprocess
+
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Optional
 
@@ -10,15 +12,63 @@ from app.simulation.telemetry_generator import generate_telemetry
 from app.simulation.campus_generator import generate_campus
 
 from app.discovery.wifi_discovery import discover_wifi_devices
+
 from app.discovery.trusted_inventory import (
     get_trusted_devices,
     trust_device,
     remove_trusted_device,
 )
+
 from app.discovery.device_history import (
     get_device_history,
     get_device_events,
 )
+
+from app.discovery.network_device_history import (
+    get_all_networks,
+    get_network_history,
+)
+
+from app.discovery.network_monitor import (
+    start_network_monitor,
+    stop_network_monitor,
+    get_network_monitor_status,
+)
+
+
+# ==========================================
+# AUTOMATIC NETWORK MONITOR LIFESPAN
+# ==========================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Start the Wi-Fi network monitor when FastAPI starts.
+
+    Stop the background monitor when FastAPI shuts down.
+    """
+
+    print(
+        "[TwinGuard] Starting automatic network monitor...",
+        flush=True,
+    )
+
+    start_network_monitor(
+        interface_alias="Wi-Fi",
+        poll_interval=10,
+    )
+
+    try:
+        yield
+
+    finally:
+        print(
+            "[TwinGuard] Stopping automatic network monitor...",
+            flush=True,
+        )
+
+        stop_network_monitor()
+
 
 # ==========================================
 # APPLICATION
@@ -28,9 +78,12 @@ app = FastAPI(
     title="TwinGuard Edge API",
     description=(
         "Offline campus network digital twin, "
-        "real Wi-Fi discovery and trusted-device management."
+        "real Wi-Fi discovery, automatic network identification, "
+        "network-specific device history and "
+        "trusted-device management."
     ),
-    version="1.2.0",
+    version="1.4.0",
+    lifespan=lifespan,
 )
 
 
@@ -39,6 +92,7 @@ app = FastAPI(
 # ==========================================
 
 class TrustDeviceRequest(BaseModel):
+
     mac_address: str = Field(
         min_length=12,
         max_length=17,
@@ -60,11 +114,15 @@ def home():
         "application": "TwinGuard Edge",
         "status": "running",
         "mode": "HYBRID",
-        "version": "1.2.0",
+        "version": "1.4.0",
         "features": [
             "Simulated campus topology",
             "Simulated network telemetry",
             "Real Wi-Fi device discovery",
+            "Automatic network identification",
+            "Automatic Wi-Fi network monitoring",
+            "Network-specific device history",
+            "Network inventory",
             "Trusted-device inventory",
         ],
     }
@@ -79,6 +137,27 @@ def health():
 
 
 # ==========================================
+# AUTOMATIC NETWORK MONITOR STATUS
+# ==========================================
+
+@app.get("/api/network-monitor/status")
+def network_monitor_status():
+    """
+    Return the current automatic Wi-Fi monitor status.
+
+    Includes:
+        - Monitor enabled state
+        - Wi-Fi connection state
+        - Current network identity
+        - Last automatic scan time
+        - Scan status
+        - Last error
+    """
+
+    return get_network_monitor_status()
+
+
+# ==========================================
 # CAMPUS DIGITAL TWIN
 # ==========================================
 
@@ -89,11 +168,13 @@ def get_campus():
 
     return {
         "data_source": "SIMULATED",
+
         "summary": {
             "departments": len(campus.departments),
             "devices": len(campus.devices),
             "connections": len(campus.connections),
         },
+
         "campus": asdict(campus),
     }
 
@@ -150,8 +231,8 @@ def get_wifi_discovery(
     Discover devices visible through an authorized
     local Wi-Fi interface.
 
-    Read-only operation.
-    Does not block or disconnect devices.
+    This is a read-only operation.
+    It does not block or disconnect devices.
     """
 
     try:
@@ -180,7 +261,37 @@ def get_wifi_discovery(
     except OSError as error:
         raise HTTPException(
             status_code=503,
-            detail="Unable to access Windows network discovery tools.",
+            detail=(
+                "Unable to access Windows network "
+                "discovery tools."
+            ),
+        ) from error
+
+
+# ==========================================
+# NETWORK INVENTORY
+# ==========================================
+
+@app.get("/api/networks")
+def list_networks():
+    """
+    Return all networks previously observed
+    by the network discovery service.
+    """
+
+    try:
+        networks = get_all_networks()
+
+        return {
+            "success": True,
+            "total_networks": len(networks),
+            "networks": networks,
+        }
+
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
         ) from error
 
 
@@ -190,9 +301,7 @@ def get_wifi_discovery(
 
 @app.get("/api/trusted-devices")
 def list_trusted_devices():
-    """
-    Return all locally approved devices.
-    """
+    """Return all locally approved devices."""
 
     try:
         devices = get_trusted_devices()
@@ -214,9 +323,7 @@ def list_trusted_devices():
 def add_trusted_device(
     request: TrustDeviceRequest,
 ):
-    """
-    Approve a device and save it in the local inventory.
-    """
+    """Approve a device and save it in the local inventory."""
 
     try:
         device = trust_device(
@@ -247,9 +354,7 @@ def add_trusted_device(
 def delete_trusted_device(
     mac_address: str,
 ):
-    """
-    Remove a device from the locally approved inventory.
-    """
+    """Remove a device from the trusted inventory."""
 
     try:
         removed = remove_trusted_device(mac_address)
@@ -262,7 +367,9 @@ def delete_trusted_device(
 
         return {
             "success": True,
-            "message": "Device removed from trusted inventory.",
+            "message": (
+                "Device removed from trusted inventory."
+            ),
         }
 
     except ValueError as error:
@@ -276,18 +383,69 @@ def delete_trusted_device(
             status_code=500,
             detail=str(error),
         ) from error
+
+
 # ==========================================
 # DEVICE HISTORY
 # ==========================================
 
 @app.get("/api/history/devices")
 def list_device_history(
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=500,
+    ),
+    network_id: Optional[str] = Query(
+        default=None,
+        min_length=1,
+        max_length=100,
+    ),
 ):
-    """Return recently observed network devices."""
+    """
+    Return device history.
+
+    With network_id:
+        Return network-specific device history.
+
+    Without network_id:
+        Preserve the legacy global history endpoint.
+    """
 
     try:
-        return get_device_history(limit)
+        if network_id is None:
+            return get_device_history(limit)
+
+        network_id = network_id.strip()
+
+        if not network_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Network ID cannot be empty.",
+            )
+
+        history = get_network_history(network_id)
+
+        if history["network"] is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Network history not found.",
+            )
+
+        devices = sorted(
+            history["devices"],
+            key=lambda item: item.get("last_seen") or "",
+            reverse=True,
+        )
+
+        return {
+            "network": history["network"],
+            "total_devices": len(history["devices"]),
+            "devices": devices[:limit],
+        }
+
+    except HTTPException:
+        raise
 
     except (ValueError, RuntimeError) as error:
         raise HTTPException(
@@ -296,14 +454,67 @@ def list_device_history(
         ) from error
 
 
+# ==========================================
+# NETWORK DEVICE EVENTS
+# ==========================================
+
 @app.get("/api/history/events")
 def list_device_events(
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=500,
+    ),
+    network_id: Optional[str] = Query(
+        default=None,
+        min_length=1,
+        max_length=100,
+    ),
 ):
-    """Return recent device discovery and change events."""
+    """
+    Return discovery and device-change events.
+
+    With network_id:
+        Return events for the selected network.
+
+    Without network_id:
+        Preserve the legacy global event-history endpoint.
+    """
 
     try:
-        return get_device_events(limit)
+        if network_id is None:
+            return get_device_events(limit)
+
+        network_id = network_id.strip()
+
+        if not network_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Network ID cannot be empty.",
+            )
+
+        history = get_network_history(network_id)
+
+        if history["network"] is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Network history not found.",
+            )
+
+        events = sorted(
+            history["events"],
+            key=lambda item: item.get("timestamp") or "",
+            reverse=True,
+        )
+
+        return {
+            "network": history["network"],
+            "total_events": len(history["events"]),
+            "events": events[:limit],
+        }
+
+    except HTTPException:
+        raise
 
     except (ValueError, RuntimeError) as error:
         raise HTTPException(

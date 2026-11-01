@@ -7,9 +7,13 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from app.discovery.device_history import (
-    record_discovery_scan,
-    get_device_history,
+from app.discovery.network_identity import (
+    build_network_identity,
+)
+
+from app.discovery.network_device_history import (
+    record_network_scan,
+    get_network_history,
 )
 
 from app.discovery.trusted_inventory import is_trusted
@@ -86,6 +90,78 @@ def _get_wifi_configuration(
     return config
 
 
+def _get_wifi_ssid(interface_alias: str) -> str:
+    """
+    Read the SSID belonging to the requested Windows Wi-Fi adapter.
+
+    Avoids accidentally selecting an SSID from another adapter.
+    """
+
+    result = subprocess.run(
+        [
+            "netsh.exe",
+            "wlan",
+            "show",
+            "interfaces",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Unable to read the Windows Wi-Fi SSID."
+        )
+
+    lines = result.stdout.splitlines()
+
+    for index, line in enumerate(lines):
+
+        name_match = re.match(
+            r"^\s*Name\s*:\s*(.*?)\s*$",
+            line,
+        )
+
+        if not name_match:
+            continue
+
+        current_name = name_match.group(1).strip()
+
+        if current_name.casefold() != interface_alias.casefold():
+            continue
+
+        # Read only the matching interface section.
+        for candidate in lines[index + 1:]:
+
+            # A new interface section has started.
+            if re.match(r"^\s*Name\s*:", candidate):
+                break
+
+            ssid_match = re.match(
+                r"^\s*SSID\s*:\s*(.*?)\s*$",
+                candidate,
+            )
+
+            if ssid_match:
+                ssid = ssid_match.group(1).strip()
+
+                if ssid:
+                    return ssid
+
+                raise RuntimeError(
+                    "The selected Wi-Fi network has no visible SSID."
+                )
+
+        raise RuntimeError(
+            f"No SSID found for adapter '{interface_alias}'."
+        )
+
+    raise RuntimeError(
+        f"Wi-Fi adapter '{interface_alias}' was not found by netsh."
+    )
+
+
 def _ping_host(
     address: str,
     source_ip: str,
@@ -113,10 +189,10 @@ def _ping_host(
         return False
 
 
-def _normalize_mac(value: str) -> str | None:
+def _normalize_mac(value: Any) -> str | None:
     """Normalize and validate a unicast MAC address."""
 
-    if not value:
+    if not isinstance(value, str) or not value:
         return None
 
     cleaned = re.sub(r"[^0-9A-Fa-f]", "", value)
@@ -200,6 +276,13 @@ def discover_wifi_devices(
     """
     Discover devices visible through an authorized Wi-Fi interface.
 
+    Features:
+        - Real Wi-Fi discovery
+        - Automatic network identification
+        - Network-specific device history
+        - Trusted-device classification
+        - Device observation timestamps
+
     This is a read-only prototype.
     It does not modify, disconnect, or block network devices.
     """
@@ -220,7 +303,26 @@ def discover_wifi_devices(
 
     network = interface.network
 
-    # Restrict the prototype to small IPv4 networks.
+    # --------------------------------------
+    # 2. IDENTIFY CURRENT NETWORK
+    # --------------------------------------
+
+    if not gateway:
+        raise RuntimeError(
+            "Default gateway is unavailable. "
+            "Cannot identify the current network."
+        )
+
+    ssid = _get_wifi_ssid(
+        interface_alias=config["interface_alias"]
+    )
+
+    network_identity = build_network_identity(
+        ssid=ssid,
+        gateway=gateway,
+        subnet=str(network),
+    )
+
     if network.num_addresses > 512:
         raise ValueError(
             "Network is larger than the prototype discovery limit."
@@ -237,10 +339,9 @@ def discover_wifi_devices(
         )
 
     # --------------------------------------
-    # 2. BUILD DISCOVERY TARGETS
+    # 3. BUILD DISCOVERY TARGETS
     # --------------------------------------
 
-    # Exclude the laptop itself.
     targets = [
         str(address)
         for address in network.hosts()
@@ -248,7 +349,7 @@ def discover_wifi_devices(
     ]
 
     # --------------------------------------
-    # 3. PERFORM ICMP DISCOVERY
+    # 4. PERFORM ICMP DISCOVERY
     # --------------------------------------
 
     with ThreadPoolExecutor(
@@ -273,7 +374,7 @@ def discover_wifi_devices(
     }
 
     # --------------------------------------
-    # 4. READ WINDOWS NEIGHBOR TABLE
+    # 5. READ WINDOWS NEIGHBOR TABLE
     # --------------------------------------
 
     neighbors = _get_neighbors(
@@ -310,7 +411,6 @@ def discover_wifi_devices(
         responded = address in responsive_ips
         is_gateway = address == gateway
 
-        # Check local trusted-device inventory.
         trusted = is_trusted(mac)
 
         if is_gateway:
@@ -320,7 +420,7 @@ def discover_wifi_devices(
         else:
             classification = "unknown"
 
-        device = {
+        devices.append({
             "ip_address": address,
             "mac_address": mac,
             "status": (
@@ -333,12 +433,12 @@ def discover_wifi_devices(
             "is_trusted": trusted,
             "classification": classification,
             "source": "windows_wifi_neighbor_table",
-        }
-
-        devices.append(device)
+            "network_id": network_identity["network_id"],
+            "network_name": network_identity["network_name"],
+        })
 
     # --------------------------------------
-    # 5. REMOVE DUPLICATES AND SORT
+    # 6. REMOVE DUPLICATES AND SORT
     # --------------------------------------
 
     unique_devices = {
@@ -354,20 +454,23 @@ def discover_wifi_devices(
     )
 
     # --------------------------------------
-    # 6. SAVE DEVICE HISTORY
+    # 7. SAVE NETWORK-SPECIFIC HISTORY
     # --------------------------------------
 
-    history_result = record_discovery_scan(devices)
+    history_result = record_network_scan(
+        network_identity,
+        devices,
+    )
 
-    # Retrieve persistent history.
-    history_data = get_device_history(limit=500)
+    history_data = get_network_history(
+        network_identity["network_id"]
+    )
 
     history_by_mac = {
         item["mac_address"]: item
         for item in history_data["devices"]
     }
 
-    # Attach history information to every discovered device.
     for device in devices:
 
         history = history_by_mac.get(
@@ -378,9 +481,13 @@ def discover_wifi_devices(
             device["first_seen"] = history.get("first_seen")
             device["last_seen"] = history.get("last_seen")
             device["sightings"] = history.get("sightings", 0)
+        else:
+            device["first_seen"] = None
+            device["last_seen"] = None
+            device["sightings"] = 0
 
     # --------------------------------------
-    # 7. CALCULATE DISCOVERY SUMMARY
+    # 8. CALCULATE DISCOVERY SUMMARY
     # --------------------------------------
 
     responsive_count = sum(
@@ -401,17 +508,25 @@ def discover_wifi_devices(
         if device["classification"] == "unknown"
     )
 
+    gateway_detected = any(
+        device["is_gateway"]
+        for device in devices
+    )
+
     # --------------------------------------
-    # 8. RETURN COMPLETE RESPONSE
+    # 9. RETURN COMPLETE RESPONSE
     # --------------------------------------
 
     return {
         "data_source": "REAL_WIFI_DISCOVERY",
         "simulation": False,
 
+        "network": network_identity,
+
         "interface": {
             "name": config["interface_alias"],
             "index": config["interface_index"],
+            "ssid": ssid,
             "ip_address": local_ip,
             "prefix_length": prefix,
             "network": str(network),
@@ -424,7 +539,7 @@ def discover_wifi_devices(
             "trusted_devices": trusted_count,
             "unknown_devices": unknown_count,
             "newly_observed_devices": history_result["new_devices"],
-            "gateway_detected": gateway is not None,
+            "gateway_detected": gateway_detected,
         },
 
         "history": history_result,
@@ -438,6 +553,8 @@ def discover_wifi_devices(
             "MAC randomization can cause previously approved devices "
             "to appear with a different MAC address.",
             "Unknown devices are not automatically considered intruders.",
+            "Network fingerprints are organizational identifiers, "
+            "not proof of network authenticity.",
             "This discovery service does not block or disconnect devices.",
         ],
     }
