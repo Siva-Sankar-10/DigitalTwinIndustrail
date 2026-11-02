@@ -1,10 +1,10 @@
 
 import 'dart:convert';
-
+import '../config/api_config.dart';
 import 'package:http/http.dart' as http;
 
 class DeviceHistoryApiService {
-  static const String baseUrl = 'http://127.0.0.1:8000';
+  static const String baseUrl = ApiConfig.baseUrl;
 
   final http.Client _client;
 

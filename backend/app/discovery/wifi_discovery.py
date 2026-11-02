@@ -411,7 +411,10 @@ def discover_wifi_devices(
         responded = address in responsive_ips
         is_gateway = address == gateway
 
-        trusted = is_trusted(mac)
+        trusted = is_trusted(
+    mac,
+    network_identity["network_id"],
+)
 
         if is_gateway:
             classification = "gateway"
