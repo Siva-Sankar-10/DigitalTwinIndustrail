@@ -91,11 +91,7 @@ def _get_wifi_configuration(
 
 
 def _get_wifi_ssid(interface_alias: str) -> str:
-    """
-    Read the SSID belonging to the requested Windows Wi-Fi adapter.
-
-    Avoids accidentally selecting an SSID from another adapter.
-    """
+    """Read the SSID belonging to the requested Windows Wi-Fi adapter."""
 
     result = subprocess.run(
         [
@@ -131,10 +127,8 @@ def _get_wifi_ssid(interface_alias: str) -> str:
         if current_name.casefold() != interface_alias.casefold():
             continue
 
-        # Read only the matching interface section.
         for candidate in lines[index + 1:]:
 
-            # A new interface section has started.
             if re.match(r"^\s*Name\s*:", candidate):
                 break
 
@@ -205,7 +199,6 @@ def _normalize_mac(value: Any) -> str | None:
 
     first_octet = int(cleaned[:2], 16)
 
-    # Ignore multicast and broadcast MAC addresses.
     if first_octet & 1:
         return None
 
@@ -272,19 +265,21 @@ def discover_wifi_devices(
     interface_alias: str = "Wi-Fi",
     timeout_ms: int = 400,
     max_workers: int = 8,
+    scan_mode: str = "quick",
 ) -> dict[str, Any]:
     """
     Discover devices visible through an authorized Wi-Fi interface.
 
-    Features:
-        - Real Wi-Fi discovery
-        - Automatic network identification
-        - Network-specific device history
-        - Trusted-device classification
-        - Device observation timestamps
+    Quick Scan:
+        Checks the gateway and existing neighbor-table candidates.
+        Maximum of 32 IP addresses are checked.
 
-    This is a read-only prototype.
-    It does not modify, disconnect, or block network devices.
+    Extended Scan:
+        Checks every usable IPv4 address in the authorized subnet.
+        Maximum subnet size is 4096 addresses.
+
+    Device observations and trusted inventory are preserved.
+    This is a read-only discovery service.
     """
 
     # --------------------------------------
@@ -323,9 +318,20 @@ def discover_wifi_devices(
         subnet=str(network),
     )
 
-    if network.num_addresses > 512:
+    # --------------------------------------
+    # 3. VALIDATE SCAN SETTINGS
+    # --------------------------------------
+
+    if not isinstance(scan_mode, str):
         raise ValueError(
-            "Network is larger than the prototype discovery limit."
+            "scan_mode must be either 'quick' or 'extended'."
+        )
+
+    scan_mode = scan_mode.strip().lower()
+
+    if scan_mode not in {"quick", "extended"}:
+        raise ValueError(
+            "scan_mode must be either 'quick' or 'extended'."
         )
 
     if max_workers < 1 or max_workers > 16:
@@ -339,17 +345,91 @@ def discover_wifi_devices(
         )
 
     # --------------------------------------
-    # 3. BUILD DISCOVERY TARGETS
+    # 4. BUILD DISCOVERY TARGETS
     # --------------------------------------
 
-    targets = [
-        str(address)
-        for address in network.hosts()
-        if str(address) != local_ip
-    ]
+    if scan_mode == "quick":
+
+        # Read existing Windows neighbor entries.
+        initial_neighbors = _get_neighbors(
+            config["interface_index"]
+        )
+
+        candidate_ips: set[str] = set()
+
+        for neighbor in initial_neighbors:
+
+            try:
+                candidate = ipaddress.ip_address(
+                    str(neighbor.get("IPAddress", ""))
+                )
+            except ValueError:
+                continue
+
+            if (
+                isinstance(candidate, ipaddress.IPv4Address)
+                and candidate in network
+                and str(candidate) != local_ip
+            ):
+                candidate_ips.add(str(candidate))
+
+        # Include the default gateway.
+        try:
+            gateway_ip = ipaddress.ip_address(gateway)
+        except ValueError as error:
+            raise RuntimeError(
+                "The default gateway is not a valid IP address."
+            ) from error
+
+        if (
+            isinstance(gateway_ip, ipaddress.IPv4Address)
+            and gateway_ip in network
+            and str(gateway_ip) != local_ip
+        ):
+            candidate_ips.add(str(gateway_ip))
+
+        sorted_candidates = sorted(
+            candidate_ips,
+            key=ipaddress.ip_address,
+        )
+
+        # Give the gateway priority.
+        targets: list[str] = []
+
+        normalized_gateway = str(gateway_ip)
+
+        if normalized_gateway in candidate_ips:
+            targets.append(normalized_gateway)
+
+        targets.extend(
+            address
+            for address in sorted_candidates
+            if address not in targets
+        )
+
+        # Maximum 32 known candidates per Quick Scan.
+        targets = targets[:32]
+
+    else:
+
+        # Extended Scan: enforce the subnet safety limit.
+        max_discovery_addresses = 4096
+
+        if network.num_addresses > max_discovery_addresses:
+            raise ValueError(
+                f"Network contains {network.num_addresses} addresses. "
+                f"The discovery limit is {max_discovery_addresses} addresses. "
+                "Use an authorized smaller subnet for discovery."
+            )
+
+        targets = [
+            str(address)
+            for address in network.hosts()
+            if str(address) != local_ip
+        ]
 
     # --------------------------------------
-    # 4. PERFORM ICMP DISCOVERY
+    # 5. PERFORM ICMP DISCOVERY
     # --------------------------------------
 
     with ThreadPoolExecutor(
@@ -374,9 +454,11 @@ def discover_wifi_devices(
     }
 
     # --------------------------------------
-    # 5. READ WINDOWS NEIGHBOR TABLE
+    # 6. READ WINDOWS NEIGHBOR TABLE
     # --------------------------------------
 
+    # Read again after ping checks because successful checks
+    # can update Windows' neighbor table.
     neighbors = _get_neighbors(
         config["interface_index"]
     )
@@ -412,9 +494,9 @@ def discover_wifi_devices(
         is_gateway = address == gateway
 
         trusted = is_trusted(
-    mac,
-    network_identity["network_id"],
-)
+            mac,
+            network_identity["network_id"],
+        )
 
         if is_gateway:
             classification = "gateway"
@@ -441,7 +523,7 @@ def discover_wifi_devices(
         })
 
     # --------------------------------------
-    # 6. REMOVE DUPLICATES AND SORT
+    # 7. REMOVE DUPLICATES AND SORT
     # --------------------------------------
 
     unique_devices = {
@@ -457,7 +539,7 @@ def discover_wifi_devices(
     )
 
     # --------------------------------------
-    # 7. SAVE NETWORK-SPECIFIC HISTORY
+    # 8. SAVE NETWORK-SPECIFIC HISTORY
     # --------------------------------------
 
     history_result = record_network_scan(
@@ -490,7 +572,7 @@ def discover_wifi_devices(
             device["sightings"] = 0
 
     # --------------------------------------
-    # 8. CALCULATE DISCOVERY SUMMARY
+    # 9. CALCULATE DISCOVERY SUMMARY
     # --------------------------------------
 
     responsive_count = sum(
@@ -517,12 +599,14 @@ def discover_wifi_devices(
     )
 
     # --------------------------------------
-    # 9. RETURN COMPLETE RESPONSE
+    # 10. RETURN COMPLETE RESPONSE
     # --------------------------------------
 
     return {
         "data_source": "REAL_WIFI_DISCOVERY",
         "simulation": False,
+
+        "scan_mode": scan_mode,
 
         "network": network_identity,
 
@@ -543,6 +627,8 @@ def discover_wifi_devices(
             "unknown_devices": unknown_count,
             "newly_observed_devices": history_result["new_devices"],
             "gateway_detected": gateway_detected,
+            "scan_mode": scan_mode,
+            "targets_checked": len(targets),
         },
 
         "history": history_result,
@@ -551,6 +637,11 @@ def discover_wifi_devices(
 
         "limitations": [
             "Only devices visible to this laptop are returned.",
+            "Quick Scan checks the gateway and existing neighbor-table "
+            "candidates only. Devices not present in the neighbor table "
+            "may be missed.",
+            "Extended Scan checks addresses in the authorized subnet "
+            "using ICMP. Devices that block ICMP may not be confirmed.",
             "ICMP-disabled devices may still appear in the neighbor table.",
             "Wi-Fi client isolation and VLANs can hide devices.",
             "MAC randomization can cause previously approved devices "

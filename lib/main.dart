@@ -1595,6 +1595,9 @@ class _TopologyPageState extends State<TopologyPage> {
 
   static const Duration _sameNetworkRefreshInterval = Duration(seconds: 60);
   Timer? _monitorTimer;
+  // Topology pagination for large networks.
+  static const int _topologyPageSize = 24;
+  int _topologyPage = 0;
 
   @override
   void initState() {
@@ -1798,6 +1801,23 @@ class _TopologyPageState extends State<TopologyPage> {
       final isLaptop = laptopIp.isNotEmpty && ip == laptopIp;
       return !isGateway && !isLaptop;
     }).toList();
+    // Calculate topology pagination.
+    final pageCount = math.max(
+      1,
+      (endpoints.length / _topologyPageSize).ceil(),
+    );
+
+    final currentPage = _topologyPage < 0
+        ? 0
+        : (_topologyPage >= pageCount ? pageCount - 1 : _topologyPage);
+
+    final startIndex = currentPage * _topologyPageSize;
+
+    final endIndex = math
+        .min(startIndex + _topologyPageSize, endpoints.length)
+        .toInt();
+
+    final visibleEndpoints = endpoints.sublist(startIndex, endIndex);
 
     // The laptop is included as the discovery source, followed by the
     // endpoints that the laptop could observe on this network.
@@ -1811,7 +1831,7 @@ class _TopologyPageState extends State<TopologyPage> {
         icon: Icons.laptop_windows_rounded,
         color: successColor,
       ),
-      ...endpoints.map((device) {
+      ...visibleEndpoints.map((device) {
         final trusted =
             device['is_trusted'] == true ||
             '${device['classification'] ?? ''}'.toLowerCase() == 'trusted';
@@ -1988,6 +2008,45 @@ class _TopologyPageState extends State<TopologyPage> {
             );
           },
         ),
+        if (pageCount > 1) ...[
+          const SizedBox(height: 12),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              IconButton(
+                tooltip: 'Previous devices',
+                onPressed: currentPage > 0
+                    ? () {
+                        setState(() {
+                          _topologyPage = currentPage - 1;
+                        });
+                      }
+                    : null,
+                icon: const Icon(Icons.chevron_left),
+              ),
+              Flexible(
+                child: Text(
+                  'Devices ${startIndex + 1}–$endIndex '
+                  'of ${endpoints.length}  '
+                  '•  Page ${currentPage + 1}/$pageCount',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 11, color: mutedColor),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Next devices',
+                onPressed: currentPage < pageCount - 1
+                    ? () {
+                        setState(() {
+                          _topologyPage = currentPage + 1;
+                        });
+                      }
+                    : null,
+                icon: const Icon(Icons.chevron_right),
+              ),
+            ],
+          ),
+        ],
         const SizedBox(height: 9),
         const Text(
           'Connection lines show inferred membership on the same discovered network. They do not prove direct cabling, switch ports, or physical device-to-device links. Pinch to zoom and drag to inspect the diagram.',

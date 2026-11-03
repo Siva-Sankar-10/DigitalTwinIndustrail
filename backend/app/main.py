@@ -254,6 +254,7 @@ def get_fault_analysis(
 # REAL WI-FI DEVICE DISCOVERY
 # ==========================================
 
+
 @app.get("/api/discovery/wifi")
 def get_wifi_discovery(
     interface_alias: str = Query(
@@ -261,12 +262,18 @@ def get_wifi_discovery(
         min_length=1,
         max_length=64,
     ),
+    scan_mode: str = Query(
+        default="quick",
+        min_length=4,
+        max_length=8,
+    ),
 ):
-    """Discover devices visible through an authorized local Wi-Fi interface."""
+    """Discover devices through an authorized local Wi-Fi interface."""
 
     try:
         return discover_wifi_devices(
             interface_alias=interface_alias,
+            scan_mode=scan_mode,
         )
     except ValueError as error:
         raise HTTPException(
@@ -288,7 +295,6 @@ def get_wifi_discovery(
             status_code=503,
             detail="Unable to access Windows network discovery tools.",
         ) from error
-
 
 # ==========================================
 # NETWORK INVENTORY

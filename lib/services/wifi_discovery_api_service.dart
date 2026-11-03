@@ -35,6 +35,7 @@ class WifiDiscoveryApiService {
   }
 
   // Reusable GET request.
+
   Future<Map<String, dynamic>> _get(
     Uri uri, {
     Duration timeout = const Duration(seconds: 20),
@@ -62,12 +63,23 @@ class WifiDiscoveryApiService {
   }
 
   // Discover actual Wi-Fi devices through the laptop.
+
   Future<Map<String, dynamic>> discoverDevices({
     String interfaceAlias = 'Wi-Fi',
+    String scanMode = 'quick',
   }) async {
-    final uri = Uri.parse(
-      '$baseUrl/api/discovery/wifi',
-    ).replace(queryParameters: {'interface_alias': interfaceAlias});
+    final normalizedMode = scanMode.trim().toLowerCase();
+
+    if (normalizedMode != 'quick' && normalizedMode != 'extended') {
+      throw ArgumentError('scanMode must be quick or extended.');
+    }
+
+    final uri = Uri.parse('$baseUrl/api/discovery/wifi').replace(
+      queryParameters: {
+        'interface_alias': interfaceAlias,
+        'scan_mode': normalizedMode,
+      },
+    );
 
     return _get(uri, timeout: const Duration(seconds: 90));
   }
